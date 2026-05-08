@@ -2,16 +2,18 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
 import {
   consumeGatewayRestartHandoffForExitedProcessSync,
   formatGatewayRestartHandoffDiagnostic,
-  GATEWAY_SUPERVISOR_RESTART_HANDOFF_FILENAME,
   GATEWAY_SUPERVISOR_RESTART_HANDOFF_KIND,
   readGatewayRestartHandoffSync,
   writeGatewayRestartHandoffSync,
 } from "./restart-handoff.js";
 
 const tempDirs: string[] = [];
+const LEGACY_GATEWAY_SUPERVISOR_RESTART_HANDOFF_FILENAME =
+  "gateway-supervisor-restart-handoff.json";
 
 function createHandoffEnv(): NodeJS.ProcessEnv {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-restart-handoff-"));
@@ -23,11 +25,15 @@ function createHandoffEnv(): NodeJS.ProcessEnv {
 }
 
 function handoffPath(env: NodeJS.ProcessEnv): string {
-  return path.join(env.OPENCLAW_STATE_DIR ?? "", GATEWAY_SUPERVISOR_RESTART_HANDOFF_FILENAME);
+  return path.join(
+    env.OPENCLAW_STATE_DIR ?? "",
+    LEGACY_GATEWAY_SUPERVISOR_RESTART_HANDOFF_FILENAME,
+  );
 }
 
 describe("gateway restart handoff", () => {
   afterEach(() => {
+    closeOpenClawStateDatabaseForTest();
     for (const dir of tempDirs.splice(0)) {
       fs.rmSync(dir, { force: true, recursive: true });
     }
@@ -58,7 +64,7 @@ describe("gateway restart handoff", () => {
       createdAt: 1_000,
       expiresAt: 61_000,
     });
-    expect(fs.statSync(handoffPath(env)).mode & 0o777).toBe(0o600);
+    expect(fs.existsSync(handoffPath(env))).toBe(false);
     expect(readGatewayRestartHandoffSync(env, 1_500)).toMatchObject({
       pid: 12_345,
       reason: "plugin source changed",
@@ -92,6 +98,7 @@ describe("gateway restart handoff", () => {
       supervisorMode: "systemd",
     });
     expect(fs.existsSync(handoffPath(env))).toBe(false);
+    expect(readGatewayRestartHandoffSync(env, 2_001)).toBeNull();
   });
 
   it("rejects handoffs for a different exited pid and clears them", () => {
@@ -142,7 +149,7 @@ describe("gateway restart handoff", () => {
     expect(fs.existsSync(handoffPath(env))).toBe(false);
   });
 
-  it("rejects malformed handoff payloads", () => {
+  it("ignores malformed legacy handoff files", () => {
     const env = createHandoffEnv();
 
     fs.writeFileSync(
@@ -163,9 +170,10 @@ describe("gateway restart handoff", () => {
     );
 
     expect(readGatewayRestartHandoffSync(env, 1_001)).toBeNull();
+    expect(fs.existsSync(handoffPath(env))).toBe(true);
   });
 
-  it("rejects expired and oversized handoff files", () => {
+  it("rejects expired SQLite handoffs and ignores oversized legacy files", () => {
     const env = createHandoffEnv();
 
     expect(
@@ -188,10 +196,10 @@ describe("gateway restart handoff", () => {
         now: 2_001,
       }),
     ).toBeNull();
-    expect(fs.existsSync(handoffPath(env))).toBe(false);
+    expect(fs.existsSync(handoffPath(env))).toBe(true);
   });
 
-  it("rejects persisted handoffs with a ttl longer than the supported window", () => {
+  it("ignores legacy persisted handoffs with a ttl longer than the supported window", () => {
     const env = createHandoffEnv();
 
     fs.writeFileSync(
@@ -218,10 +226,10 @@ describe("gateway restart handoff", () => {
         now: 1_001,
       }),
     ).toBeNull();
-    expect(fs.existsSync(handoffPath(env))).toBe(false);
+    expect(fs.existsSync(handoffPath(env))).toBe(true);
   });
 
-  it("does not follow an existing handoff-path symlink when writing", () => {
+  it("does not touch an existing legacy handoff-path symlink when writing", () => {
     const env = createHandoffEnv();
     const targetPath = path.join(env.OPENCLAW_STATE_DIR ?? "", "attacker-target.txt");
     fs.writeFileSync(targetPath, "keep", "utf8");
@@ -241,7 +249,7 @@ describe("gateway restart handoff", () => {
     ).not.toBeNull();
 
     expect(fs.readFileSync(targetPath, "utf8")).toBe("keep");
-    expect(fs.lstatSync(handoffPath(env)).isSymbolicLink()).toBe(false);
+    expect(fs.lstatSync(handoffPath(env)).isSymbolicLink()).toBe(true);
     expect(
       consumeGatewayRestartHandoffForExitedProcessSync({
         env,
